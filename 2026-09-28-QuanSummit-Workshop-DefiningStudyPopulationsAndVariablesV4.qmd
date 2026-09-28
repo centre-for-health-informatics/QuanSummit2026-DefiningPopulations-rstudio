@@ -1,0 +1,480 @@
+---
+title: "Defining Study Populations and Variables"
+subtitle: "Quan Summit 2026 — 30 minute workshop"
+author: "Elliot Martin"
+date: 2026-09-28
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    code-tools: true
+    df-print: paged
+editor: visual
+execute:
+  warning: false
+  message: false
+---
+
+# Quan Summit 2026-09-28: Defining Study Populations and Variables
+
+In this workshop we'll do a mini study looking at the effects of different comorbidities on Heart Failure (HF) readmission. This will involve,
+
+1.  Selecting a HF cohort from the Discharge Abstract Database (DAD)
+2.  Determining which patients were readmitted (our outcome)
+3.  Identifying the comorbidities of interest in our cohort (our exposures), using the DAD and physician claims
+4.  Running a simple survival analysis
+
+## Load/Install necessary modules
+
+```{r}
+#| label: load libraries 
+  #install.packages(c("readr", "dplyr", "tidyr", "stringr",
+  #                  "tibble", "ggplot2", "survival"))
+
+library(readr)     # read_csv, column type control
+library(dplyr)     # filter / mutate / group_by / joins
+library(tidyr)     # pivot_longer, pivot_wider
+library(stringr)   # str_detect for code matching
+library(tibble)    # tibble(), tribble()
+library(ggplot2)   # plots
+library(survival)  # Surv, coxph, survfit, concordance
+
+```
+
+## Load the data and take a quick look
+
+::: callout-important
+**All the data used in this notebook has been synthetically generated** - The proportions of different conditions have been engineered for this work and are not based on real data - Claude was used for the synthetic generation script, which works for this illustration, but you shouldn't take away anything from the data generated - The script used to generate the data is `generate-data.R` and can be found in the `code` folder of the git repo - you can use the script to generate additional data sets, or do things like tweak the proportion of HF admissions etc. - the script is expecting the directory structure of the repo, i.e., be run from the `code` folder and save the data to the `data` folder
+:::
+
+### Load DAD data
+
+```{r}
+#| label: load data
+
+dad <- read_csv(
+  "data/dad_synthetic.csv",
+  col_types  = cols(
+    .default   = col_character(),
+    AGE        = col_integer(),
+    ADMIT_DTTM = col_datetime("%Y-%m-%d %H:%M"),
+    DISCH_DTTM = col_datetime("%Y-%m-%d %H:%M")
+  )
+)
+glimpse(dad[, 1:10])
+```
+
+Look at some statistics of the DAD data
+
+```{r}
+#| label: Examine DAD
+dad |>
+  summarise(
+    admissions   = n(),
+    patients    = n_distinct(PATIENT_ID),
+    first_admit = min(ADMIT_DTTM),
+    last_admit  = max(ADMIT_DTTM)
+  )
+
+```
+
+Look at how many patients had multiple admissions
+
+```{r}
+#| label: Admission Distribution
+dad |>
+  count(PATIENT_ID, name = "admissions") |>       # one row per patient
+  count(admissions, name = "patients")
+```
+
+### Load Claims data
+
+```{r}
+claims <- read_csv(
+  "data/claims_synthetic.csv",
+  col_types = cols(
+    .default     = col_character(),
+    SERVICE_DATE = col_date("%Y-%m-%d")
+  )
+)
+
+glimpse(claims)
+```
+
+Look at some statistics for the claims data
+
+```{r}
+#| label: Examine Claims
+claims |>
+  summarise(
+    claims        = n(),
+    patients      = n_distinct(PATIENT_ID),
+    first_service = min(SERVICE_DATE),
+    last_service  = max(SERVICE_DATE)
+  )
+```
+
+## Build the final cohort
+
+### Select all Heart Failure admissions
+
+::: callout-important
+The DAD does not use decimal places in ICD-10-CA codes, so I50.0 will be represented as I500
+:::
+
+```{r}
+# Quan et al. (2005) ICD-10 congestive heart failure codes. 
+hf_pattern <- "^I099|^I110|^I130|^I132|^I255|^I420|^I42[5-9]|^I43|^I50|^P290"
+
+# DXCODE1 is the most responsible diagnosis -- the reason for the stay.
+hf_admissions <- dad |>
+  filter(str_detect(DXCODE1, hf_pattern), AGE >= 18) |>
+  select(PATIENT_ID, ENCOUNTER_ID, ADMIT_DTTM, DISCH_DTTM)
+
+hf_admissions |>
+  summarise(admissions = n(), patients = n_distinct(PATIENT_ID))
+```
+
+### Construct episodes of care
+
+A patient may have multiple entries in the DAD, but they could be considered one "Episode of Care", e.g., a patient moved from a rural site to a larger hospital generates **two DAD entries** but should be considered **one** episode of care.
+
+We are using a simple algorithm here, and considering any admission within 12 hours of discharge to be the same episode of care. CIHI uses a slightly different algorithm, with varying time windows depending on if the transfer was coded or not.
+
+```{r}
+#| label: outcome parameters
+EPISODE_GAP_HOURS <- 12    # admission < this many hours after discharge = same episode
+DEATH_DISP        <- c("07", "72", "73", "74")  # died: pre-2018 code + 2018+ codes 
+```
+
+```{r}
+#| label: episodes of care
+admissions <- dad |>
+  filter(PATIENT_ID %in% hf_admissions$PATIENT_ID) |>
+  select(PATIENT_ID, ENCOUNTER_ID, ADMIT_CATEGORY,
+         ADMIT_DTTM, DISCH_DTTM, DISCH_DISP) |>
+  arrange(PATIENT_ID, ADMIT_DTTM) |>
+  mutate(
+    same_patient     = PATIENT_ID == lag(PATIENT_ID, default = ""),
+    hours_since_prev = if_else(same_patient,
+                               as.numeric(difftime(ADMIT_DTTM, lag(DISCH_DTTM),
+                                                   units = "hours")),
+                               NA_real_),
+    # Continues the previous episode if admitted within the gap.
+    continues_prev = coalesce(hours_since_prev < EPISODE_GAP_HOURS, FALSE),
+    episode        = cumsum(!continues_prev)   # a unique id per episode
+  )
+
+# An episode STARTS on a row that doesn't continue the previous one, and
+# ENDS on a row whose next row doesn't continue it.
+episode_start <- admissions |>
+  filter(!continues_prev) |>
+  select(PATIENT_ID, episode,
+         ep_admit = ADMIT_DTTM, ep_category = ADMIT_CATEGORY)  # how it STARTED
+
+episode_end <- admissions |>
+  filter(!lead(continues_prev, default = FALSE)) |>
+  select(episode, ep_disch = DISCH_DTTM, ep_disp = DISCH_DISP) # how it ENDED
+
+episodes <- episode_start |>
+  inner_join(episode_end, by = "episode") |>
+  inner_join(admissions |> count(episode, name = "n_admissions"), by = "episode")
+
+tibble(admissions = nrow(admissions), episodes = nrow(episodes))
+episodes |> count(n_admissions, name = "episodes")
+```
+
+### First HF Admission (Index episode)
+
+```{r}
+#| label: index-episode
+index <- hf_admissions |>
+  inner_join(admissions |> select(ENCOUNTER_ID, episode), by = "ENCOUNTER_ID") |>
+  arrange(PATIENT_ID, ADMIT_DTTM) |>
+  distinct(PATIENT_ID, .keep_all = TRUE) |>   # keeps each patient's first row
+  inner_join(episodes, by = c("PATIENT_ID", "episode")) |> 
+  filter(!ep_disp %in% DEATH_DISP)               #excluding dead patients since they can't return
+    
+glimpse(index)
+```
+
+### Determine the outcome for each member of the cohort
+
+This will be whether/when they are readmitted after their index hospitalization.
+
+```{r}
+#| label: readmissions
+# Readmission = the first UNPLANNED (urgent) episode starting after the index
+# episode's discharge. Episodes, not abstracts: a transfer is not a readmit.
+readmits <- index |>
+  select(PATIENT_ID, ep_disch) |>
+  inner_join(
+    episodes |> select(PATIENT_ID, r_admit = ep_admit, r_category = ep_category),
+    by = "PATIENT_ID"
+  ) |>
+  filter(r_admit > ep_disch)
+
+# How many later episodes were planned (elective)? These are NOT events.
+readmits |> count(r_category)
+
+first_readmit <- readmits |>
+  filter(r_category == "U") |>
+  arrange(PATIENT_ID, r_admit) |>
+  distinct(PATIENT_ID, .keep_all = TRUE) |>   # earliest unplanned episode
+  select(PATIENT_ID, first_readmit = r_admit)
+```
+
+### Build the final cohort
+
+```{r}
+#| label: build-cohort
+
+STUDY_END <- max(dad$ADMIT_DTTM)
+
+cohort <- index |>
+  left_join(first_readmit, by = "PATIENT_ID") |>
+  mutate(
+    days_to_readmit = as.numeric(difftime(first_readmit, ep_disch, units = "days")),
+    days_to_end     = as.numeric(difftime(STUDY_END,     ep_disch, units = "days")),
+    # Time at risk = min(time to readmission, time to administrative end)
+    time_days = pmin(coalesce(days_to_readmit, Inf), days_to_end),
+    event     = as.integer(!is.na(days_to_readmit) & days_to_readmit <= time_days)
+  ) |>
+  filter(time_days > 0)     # remove events with no observable follow-up
+
+
+cohort |>
+  summarise(patients = n(), readmitted = sum(event),
+            rate = mean(event), median_days_at_risk = median(time_days))
+```
+
+## Determine the exposures for each patient
+
+These will be the comorbidities that we want to check if they affect the outcome. Let's pick a few.
+
+### Age
+
+This will be the easiest variable to get, which we can get from the DAD. It can be computed from the date of admission and birthdate, but unless there is a clear need birthdate will likely not be released due to its identifiable nature. Instead the analyst will generally compute the age for you and release that.
+
+```{r}
+#| label: age
+# AGE is age at THAT admission. Check: does it change within patient?
+dim(cohort)
+cohort <- cohort |>
+  inner_join(dad |> select(AGE, ENCOUNTER_ID), by = "ENCOUNTER_ID")
+
+dim(cohort)
+```
+
+```{r}
+#| label: age-plot
+ggplot(cohort, aes(x = AGE)) +
+  geom_histogram(binwidth = 5, fill = "grey30") +
+  labs(title = "Age at index HF admission", x = "Age (years)", y = "Patients") +
+  theme_minimal()
+```
+
+### Sex
+
+Sex is a categorical variable, but there are a few things to keep in mind.
+
+1.  The categories are not just M/F
+2.  The data doesn't do a very good job at disentangling gender and sex
+
+```{r}
+#| label: sex
+
+cohort <- cohort |>
+  inner_join(dad |> select(SEX, ENCOUNTER_ID), by = "ENCOUNTER_ID") |>
+  mutate(SEX = factor(SEX, levels = c("F", "M", "O", "U")))
+
+cohort |> count(SEX, .drop = FALSE)
+```
+
+### COPD
+
+This is our first comorbidity which we will look for in the DAD using the presented algorithms.
+
+```{r}
+#| label: copd
+copd_codes <- "^I27[89]|^J4[0-4]|^J4[67]|^J6[0-7]|^J684|^J70[13]"
+
+cohort <- cohort |>
+  inner_join(dad |> 
+                filter(ENCOUNTER_ID %in% cohort$ENCOUNTER_ID) |>
+                mutate(copd = as.integer(
+                 if_any(starts_with("DXCODE"), ~ str_detect(coalesce(.x, ""), copd_codes))
+               )) |>
+                select(ENCOUNTER_ID, copd),
+               by="ENCOUNTER_ID"
+               )
+
+mean(cohort$copd)
+```
+
+### CKD
+
+This is our second comorbidity which we will look for in the DAD using the presented algorithms.
+
+```{r}
+#| label: ckd
+ckd_codes <- "^N0[0-9]|^N1[0-9]|^N2[0-3]"
+
+cohort <- cohort |>
+  inner_join(dad |> 
+                filter(ENCOUNTER_ID %in% cohort$ENCOUNTER_ID) |>
+                mutate(ckd = as.integer(
+                 if_any(starts_with("DXCODE"), ~ str_detect(coalesce(.x, ""), ckd_codes))
+               )) |>
+                select(ENCOUNTER_ID, ckd),
+               by="ENCOUNTER_ID"
+               )
+
+mean(cohort$ckd)
+```
+
+### Hypertension
+
+This is the last comorbidity we will look at. As hypertension is not usually diagnosed in hospital, and is generally not directly responsible for a large use of resources in the hospital, it is known to have low sensitivity in the DAD. Therefore for this case we will also use claims data.
+
+```{r}
+#| label: htn-linkage
+
+htn_icd10 <- "^I1[0-35]"
+htn_icd9 <- "^40[1-5]"
+
+window_days <- 365*2
+
+
+dad_htn <- cohort |>
+  inner_join(dad |> 
+                filter(ENCOUNTER_ID %in% cohort$ENCOUNTER_ID) |>
+                mutate(htn_dad = as.integer(
+                 if_any(starts_with("DXCODE"), ~ str_detect(coalesce(.x, ""), htn_icd10))
+               )) |>
+                select(ENCOUNTER_ID, htn_dad),
+               by="ENCOUNTER_ID"
+               ) |>
+  select(PATIENT_ID, htn_dad)
+
+claims_htn <- claims |>
+  filter(PATIENT_ID %in% cohort$PATIENT_ID) |>
+  inner_join(cohort |> select(PATIENT_ID, index_admit = ADMIT_DTTM),
+             by = "PATIENT_ID") |>
+  filter(SERVICE_DATE < as.Date(index_admit)) |>
+  mutate(htn = as.integer(
+                 if_any(starts_with("DXCODE"), ~ str_detect(coalesce(.x, ""), htn_icd9))
+               )) |>
+  arrange(PATIENT_ID, htn, SERVICE_DATE) |>
+  mutate(
+    k_row     = row_number() + 2 - 1,        # row of the k-th claim
+    same_run  = PATIENT_ID[k_row] == PATIENT_ID,    # same patient
+    span_days = as.numeric(SERVICE_DATE[k_row] - SERVICE_DATE)
+  ) |>
+  filter(same_run, span_days <= window_days) |>       # NA past the end drops out
+  distinct(PATIENT_ID, htn) |>
+  group_by(PATIENT_ID) |>
+  summarise(htn_claims = as.integer(any(htn==1)))
+  
+htn_admin <- dad_htn|>
+  inner_join(claims_htn, by = "PATIENT_ID") |>
+  mutate(htn = as.integer(htn_dad==1 |htn_claims==1))
+
+
+cohort <- cohort |> 
+  inner_join(htn_admin |> select(PATIENT_ID, htn), by = "PATIENT_ID")
+
+mean(cohort$htn)
+```
+
+## Analyze the data
+
+### Let's take a look at our dataframe first and get some statistics we'll need for table 1
+
+```{r}
+#| label: table1
+# Suppress any count between 1 and 4 at the point the table is built, not
+# afterwards by hand.
+n_pct <- function(x) {
+  n <- sum(x)
+  if (n > 0 && n < 5) "<5" else sprintf("%d (%.0f%%)", n, 100 * mean(x))
+}
+
+table1 <- cohort |>
+  group_by(readmitted = if_else(event == 1L, "Readmitted", "Not readmitted")) |>
+  summarise(
+    n           = as.character(n()),
+    age_mean_sd = sprintf("%.1f (%.1f)", mean(AGE), sd(AGE)),
+    female      = n_pct(SEX == "F"),
+    sex_O_or_U  = n_pct(SEX %in% c("O", "U")),
+    copd        = n_pct(copd == 1),
+    ckd         = n_pct(ckd == 1),
+    htn         = n_pct(htn == 1)
+  )
+
+# Transpose so variables are rows -- the usual Table 1 layout.
+table1 |>
+  pivot_longer(-readmitted, names_to = "variable") |>
+  pivot_wider(names_from = readmitted, values_from = value)
+```
+
+### Survival Analysis
+
+#### Split the data into derivation and validation sets
+
+```{r}
+#| label: split
+set.seed(1234)
+
+# Stratify on the outcome so both halves get the same event rate.
+cohort <- cohort |>
+  group_by(event) |>
+  mutate(split = if_else(row_number() %in% sample(n(), round(0.7 * n())),
+                         "derivation", "validation")) |>
+  ungroup()
+
+cohort |> count(split, event)
+```
+
+#### Fit a model to the derivation set
+
+```{r}
+#| label: cox
+derivation <- cohort |> filter(split == "derivation") |> droplevels()
+
+fit <- coxph(
+  Surv(time_days, event) ~ AGE + SEX + copd + ckd + htn,
+  data = derivation
+)
+
+summary(fit)
+```
+
+```{r}
+#| label: hr-table
+# Tidy HR table without {broom} (keeps the webR dependency list short).
+ci <- summary(fit)$conf.int
+cf <- summary(fit)$coefficients
+
+tibble(
+  term  = rownames(ci),
+  HR    = round(ci[, "exp(coef)"], 2),
+  lower = round(ci[, "lower .95"], 2),
+  upper = round(ci[, "upper .95"], 2),
+  p     = signif(cf[, "Pr(>|z|)"], 2)
+)
+```
+
+#### Check the model performance on the validation set
+
+```{r}
+#| label: validate
+validation <- cohort |> filter(split == "validation")
+
+# Harrell's C on data the model has never seen...
+concordance(fit, newdata = validation)
+
+# ...versus apparent (over-optimistic) performance on the derivation set.
+concordance(fit)
+```
