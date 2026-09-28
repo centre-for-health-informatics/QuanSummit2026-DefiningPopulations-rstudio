@@ -25,6 +25,14 @@ In this workshop we'll do a mini study looking at the effects of different comor
 3.  Identifying the comorbidities of interest in our cohort (our exposures), using the DAD and physician claims
 4.  Running a simple survival analysis
 
+The github repo for this code to run in RStudio can be found at: https://github.com/centre-for-health-informatics/QuanSummit2026-DefiningPopulations-rstudio
+
+![RStudio QR Code](assets/QuanSummit2026-rstudio-qr.svg){width="250" fig-align="center"}
+
+A web version of this can be found at https://centre-for-health-informatics.github.io/QuanSummit2026-DefiningPopulations-webr/
+
+![webr QR Code](assets/QuanSummit2026-webr-qr.svg){width="250" fig-align="center"}
+
 ## Load/Install necessary modules
 
 ```{r}
