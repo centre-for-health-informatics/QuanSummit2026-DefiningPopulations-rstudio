@@ -123,7 +123,7 @@ claims |>
   )
 ```
 
-## Build the final cohort
+## Build the cohort
 
 ### Select all Heart Failure admissions
 
@@ -164,7 +164,7 @@ admissions <- dad |>
          ADMIT_DTTM, DISCH_DTTM, DISCH_DISP) |>
   arrange(PATIENT_ID, ADMIT_DTTM) |>
   mutate(
-    same_patient     = PATIENT_ID == lag(PATIENT_ID, default = ""),
+    same_patient     = PATIENT_ID == laxg(PATIENT_ID, default = ""),
     hours_since_prev = if_else(same_patient,
                                as.numeric(difftime(ADMIT_DTTM, lag(DISCH_DTTM),
                                                    units = "hours")),
